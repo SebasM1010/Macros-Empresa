@@ -1,0 +1,225 @@
+function procesarFacturasRecepcionActualizable() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaOrigen = ss.getSheetByName("Recepción");
+  if (!hojaOrigen) { SpreadsheetApp.getActiveSpreadsheet().toast("No se encontró la hoja 'Recepción'."); return; }
+  const hojaReporte = ss.getSheetByName("Reporte Final");
+  if (!hojaReporte) { SpreadsheetApp.getActiveSpreadsheet().toast("No se encontró la hoja 'Reporte Final'."); return; }
+
+  // auxiliares
+  let hojaNoFacturas = ss.getSheetByName("No Facturas");
+  if (!hojaNoFacturas) hojaNoFacturas = ss.insertSheet("No Facturas");
+  let hojaValidacion = ss.getSheetByName("Resultados") || ss.insertSheet("Resultados");
+
+  // limpiar auxiliares y preparar reporte
+  hojaNoFacturas.clearContents();
+  hojaValidacion.clearContents();
+  hojaReporte.clearContents();
+  hojaReporte.getRange("A1:M1").setValues([[
+    "BillNo","Supplier","BillDate","DueDate","Terms","Location","Memo","Account",
+    "LineDescription","LineAmount","LineTaxCode","LineTaxAmount","Currency"
+  ]]);
+
+  const datos = hojaOrigen.getDataRange().getValues();
+  if (datos.length <= 1) {
+    SpreadsheetApp.getActiveSpreadsheet().toast("La hoja 'Recepción' está vacía o sólo tiene encabezado.");
+    return;
+  }
+
+  // helpers
+  const normalize = s => String(s || "").trim().toUpperCase().replace(/\s+/g, " ");
+  function parseNumber(v) {
+    if (v === null || v === undefined || v === "") return 0;
+    let s = String(v).trim();
+    let negative = false;
+    if (/^\(.*\)$/.test(s)) { negative = true; s = s.replace(/[\(\)]/g,""); }
+    s = s.replace(/[^\d\.\-\,]/g, "");
+    s = s.replace(/,/g, "");
+    if (s === "" || s === "." || s === "-") return 0;
+    let num = parseFloat(s);
+    if (isNaN(num)) return 0;
+    if (negative) num = -Math.abs(num);
+    return num;
+  }
+  function parseFechaToDate(fecha) {
+    if (fecha instanceof Date && !isNaN(fecha.getTime())) return new Date(fecha.getTime());
+    if (typeof fecha === "number" && !isNaN(fecha)) {
+      // si es ms epoch
+      if (fecha > 1e12) {
+        const d = new Date(fecha);
+        if (!isNaN(d.getTime())) return d;
+      }
+      // tratar como serial Excel/Sheets (days since 1899-12-30)
+      const epoch = new Date(Date.UTC(1899,11,30));
+      const ms = Math.round(fecha) * 24*60*60*1000;
+      const d = new Date(epoch.getTime() + ms);
+      if (!isNaN(d.getTime())) return d;
+    }
+    if (typeof fecha === "string") {
+      const p = Date.parse(fecha);
+      if (!isNaN(p)) return new Date(p);
+      const m = fecha.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+      if (m) {
+        let dd = parseInt(m[1],10), mm = parseInt(m[2],10)-1, yy = parseInt(m[3],10);
+        if (yy < 100) yy += 2000;
+        const d2 = new Date(yy, mm, dd);
+        if (!isNaN(d2.getTime())) return d2;
+      }
+    }
+    return null;
+  }
+
+  // configuración de columnas (0-based)
+  const idxTipo = 1;   // B
+  const idxConsecutivo = 4; // E
+  const idxEmisor = 8; // I
+  const idxFecha = 10; // K (BillDate)
+  const idxGravado = 15; // P
+  const idxExento = 16;  // Q
+  const idxImp1 = 23;  // X
+  const idxImp2 = 24;  // Y
+  const idxImp4 = 25;  // Z
+  const idxImp8 = 26;  // AA
+  const idxImp13 = 27; // AB
+  const idxMoneda = 31; // AF
+  const idxTC = 32;     // AG
+  const columnasImpuestos = [idxImp1, idxImp2, idxImp4, idxImp8, idxImp13];
+  const tasas = [1,2,4,8,13];
+
+  // encabezados nuevos a crear si faltan (no duplicar)
+  const nuevosEncabezados = [
+    "Subtotal 1%", "Subtotal 2%", "Subtotal 4%", "Subtotal 8%", "Subtotal 13%",
+    "Subtotal Colonizado 1%", "Subtotal Colonizado 2%", "Subtotal Colonizado 4%",
+    "Subtotal Colonizado 8%", "Subtotal Colonizado 13%", "Subtotal Colonizado 0%",
+    "Subtotal Colonizado Total"
+  ];
+
+  const encabezadosExistentes = datos[0].map(h => String(h || "").trim());
+  const mapExist = {};
+  for (let c = 0; c < encabezadosExistentes.length; c++) mapExist[ normalize(encabezadosExistentes[c]) ] = c + 1;
+  let lastCol = hojaOrigen.getLastColumn();
+  for (const h of nuevosEncabezados) {
+    const hn = normalize(h);
+    if (!mapExist[hn]) {
+      lastCol++;
+      hojaOrigen.getRange(1, lastCol).setValue(h);
+      mapExist[hn] = lastCol;
+    } else {
+      const colIndex = mapExist[hn];
+      const actual = String(hojaOrigen.getRange(1, colIndex).getValue() || "");
+      if (actual !== h) hojaOrigen.getRange(1, colIndex).setValue(h);
+    }
+  }
+
+  // re-crear índice 0-based de encabezados actualizados
+  const encabezadosActualizados = hojaOrigen.getRange(1, 1, 1, hojaOrigen.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const mapIdx = {};
+  for (let c = 0; c < encabezadosActualizados.length; c++) mapIdx[ normalize(encabezadosActualizados[c]) ] = c; // 0-based
+
+  if (!(normalize("Subtotal 1%") in mapIdx)) {
+    SpreadsheetApp.getActiveSpreadsheet().toast("No se encontró dónde escribir subtotales. Revisa encabezados.");
+    return;
+  }
+  const startCol = mapIdx[ normalize("Subtotal 1%") ] + 1;
+  const numNewCols = nuevosEncabezados.length; // 12
+
+  // arrays para escritura en bloque
+  const outRows = [];
+  const finalRows = [];
+  const noFactRows = [];
+  noFactRows.push(datos[0]); // encabezado original
+  const inconsistencias = [];
+
+  // recorrer filas
+  for (let i = 1; i < datos.length; i++) {
+    const fila = datos[i];
+    const tipoDoc = String(fila[idxTipo] || "").trim();
+    const consecutivo = fila[idxConsecutivo] || "";
+    const emisor = fila[idxEmisor] || "";
+    const fechaRaw = fila[idxFecha];
+    const fechaObj = parseFechaToDate(fechaRaw); // parse robusto
+    const gravado = parseNumber(fila[idxGravado]);
+    const exento = parseNumber(fila[idxExento]);
+    const moneda = String(fila[idxMoneda] || "").toUpperCase().trim();
+    const tipoCambio = parseNumber(fila[idxTC]);
+
+    // fila out vacía por defecto
+    let filaOut = new Array(numNewCols).fill("");
+
+    if (tipoDoc !== "Factura Electrónica") {
+      noFactRows.push(fila);
+      outRows.push(filaOut);
+      continue;
+    }
+
+    // calcular subtotales (bases) y colonizados (solo si AF == "USD" usar AG)
+    const subt = [0,0,0,0,0];
+    const subtC = [0,0,0,0,0];
+    let sumaSub = 0;
+    for (let t = 0; t < columnasImpuestos.length; t++) {
+      const impVal = parseNumber(fila[columnasImpuestos[t]]);
+      if (impVal !== 0) {
+        const base = impVal / (tasas[t] / 100);
+        subt[t] = base;
+        sumaSub += base;
+        subtC[t] = (moneda === "USD") ? base * tipoCambio : base;
+      }
+    }
+
+    // exento desde Q y colonizado según AG (AF == USD)
+    const exentoColonizado = (moneda === "USD") ? exento * tipoCambio : exento;
+    const totalColonizado = subtC.reduce((a,b)=>a+b,0) + exentoColonizado;
+
+    // llenar filaOut: [Subtotal1..5, SubC1..5, SubC0, SubC Total] => 12 cols
+    filaOut = [
+      subt[0], subt[1], subt[2], subt[3], subt[4],
+      subtC[0], subtC[1], subtC[2], subtC[3], subtC[4],
+      exentoColonizado, totalColonizado
+    ];
+    outRows.push(filaOut);
+
+    // DueDate: SUMAR 30 DÍAS a BillDate (fechaObj)
+    const dueDate = fechaObj ? new Date(fechaObj.getTime() + 30 * 24 * 60 * 60 * 1000) : "";
+
+    // generar filas para Reporte Final:
+    // una fila por cada subtotal (incluye negativos), y si exento != 0 agrega fila 0%
+    for (let t = 0; t < subt.length; t++) {
+      if (subt[t] !== 0) {
+        finalRows.push([consecutivo, emisor, fechaObj || "", dueDate, "", "", "", "Compras", "", subtC[t], tasas[t] + "%", "", "CRC"]);
+      }
+    }
+    if (exento !== 0) {
+      finalRows.push([consecutivo, emisor, fechaObj || "", dueDate, "", "", "", "Compras", "", exentoColonizado, "0%", "", "CRC"]);
+    }
+
+    // validación suma subtotales vs gravado
+    if (Math.abs(sumaSub - gravado) > 0.01) {
+      inconsistencias.push([consecutivo, emisor, sumaSub, gravado]);
+    }
+  }
+
+  // escribir subtotales en Recepción (en bloque)
+  if (outRows.length > 0) {
+    hojaOrigen.getRange(2, startCol, outRows.length, numNewCols).setValues(outRows);
+  }
+
+  // escribir Reporte Final
+  if (finalRows.length > 0) {
+    hojaReporte.getRange(2, 1, finalRows.length, finalRows[0].length).setValues(finalRows);
+  }
+
+  // escribir No Facturas
+  if (noFactRows.length > 1) {
+    hojaNoFacturas.clearContents();
+    hojaNoFacturas.getRange(1,1,noFactRows.length,noFactRows[0].length).setValues(noFactRows);
+    SpreadsheetApp.getActiveSpreadsheet().toast(`⚠️ ${noFactRows.length-1} filas no son 'Factura Electrónica' (hoja 'No Facturas').`);
+  }
+
+  // escribir inconsistencias
+  if (inconsistencias.length > 0) {
+    hojaValidacion.clearContents();
+    hojaValidacion.getRange(1,1,1,4).setValues([["Consecutivo","Proveedor","SumaSubtotales","TotalGravado"]]);
+    hojaValidacion.getRange(2,1,inconsistencias.length,4).setValues(inconsistencias);
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast(`✅ Proceso finalizado. ${finalRows.length} líneas en 'Reporte Final'.`);
+}

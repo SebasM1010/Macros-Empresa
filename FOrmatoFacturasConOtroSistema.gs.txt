@@ -1,0 +1,121 @@
+function generarFormatoQuickBooksTodoEnUno_V2_LIQ() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaBase = ss.getSheetByName("Prueba");
+  const hojaRebajos = ss.getSheetByName("Rebajos");
+  const hojaTC = ss.getSheetByName("TipoCambio");
+  const hojaSalida = ss.getSheetByName("Resultado");
+
+  if (!hojaBase || !hojaRebajos || !hojaTC || !hojaSalida) {
+    SpreadsheetApp.getActiveSpreadsheet().toast("❌ Verifica que existan las hojas: Prueba, Rebajos, TipoCambio y Resultado.");
+    return;
+  }
+
+  const tcDefault = parseFloat(String(hojaTC.getRange("B1").getValue()).replace(/,/g, "")) || 0;
+
+  // -------- 1) Calcular TC BANCO en Rebajos (columna I) --------
+  const datosRebajos = hojaRebajos.getDataRange().getValues();
+  const outTC = [];
+  for (let i = 1; i < datosRebajos.length; i++) {
+    const retIva = parseFloat(String(datosRebajos[i][3] || "").replace(/,/g, "")) || 0;   // D
+    const retIvaLocal = parseFloat(String(datosRebajos[i][6] || "").replace(/,/g, "")) || 0; // G
+    const existingTC = parseFloat(String(datosRebajos[i][8] || "").replace(/,/g, "")) || 0;  // I
+    let tcBanco = "";
+    if (retIva > 0 && retIvaLocal > 0) {
+      tcBanco = retIvaLocal / retIva;
+    } else if (existingTC > 0) {
+      tcBanco = existingTC;
+    }
+    outTC.push([tcBanco]);
+  }
+  hojaRebajos.getRange(2, 9, outTC.length, 1).setValues(outTC);
+
+  // Crear mapa LIQ -> TC
+  const datosRebajosAct = hojaRebajos.getDataRange().getValues();
+  const mapaRebajos = new Map();
+  for (let i = 1; i < datosRebajosAct.length; i++) {
+    const liqRaw = String(datosRebajosAct[i][1] || "").trim(); // B
+    const liqDigits = liqRaw.replace(/\D/g, "");
+    const tcBancoVal = parseFloat(String(datosRebajosAct[i][8] || "").replace(/,/g, "")) || 0; // I
+    if (liqDigits) mapaRebajos.set(liqDigits, tcBancoVal);
+  }
+
+  // -------- 2) Calcular Monto1 en Prueba (columna L) --------
+  const datosBase = hojaBase.getDataRange().getValues();
+  const outMontos = [];
+  for (let i = 1; i < datosBase.length; i++) {
+    const deb = parseFloat(String(datosBase[i][7] || "").replace(/,/g, "")) || 0; // H
+    const cred = parseFloat(String(datosBase[i][8] || "").replace(/,/g, "")) || 0; // I
+    const monto = cred - deb;
+    outMontos.push([monto]);
+  }
+  hojaBase.getRange(2, 12, outMontos.length, 1).setValues(outMontos);
+
+  // -------- 3) Generar resultado usando LIQ extraído de la descripción --------
+  const reAFI = /^AFI/i;
+  const reLIQ = /LIQ[\s\-:]*([0-9]+)/i;
+  const limpiar = txt => String(txt || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const salida = [];
+  const noEncontrados = [];
+
+  const datosBaseAct = hojaBase.getDataRange().getValues();
+
+  for (let i = 1; i < datosBaseAct.length; i++) {
+    const fila = datosBaseAct[i];
+    const fecha = fila[0];
+    const referencia = [fila[1], fila[2]].filter(Boolean).join(" ").trim();
+    const codigo = fila[3];
+    let descripcion = [fila[4], fila[5], fila[6]].filter(Boolean).join(" ");
+    descripcion = limpiar(descripcion);
+    const nota = [referencia, codigo, descripcion].filter(Boolean).join(" ").trim();
+
+    const montoUSD = parseFloat(String(fila[11] || "").replace(/,/g, "")) || 0;
+    let tcUsado = tcDefault;
+
+    // Solo procesar si empieza con AFI
+    if (reAFI.test(descripcion)) {
+      // buscar número después de LIQ
+      const matchLiq = descripcion.match(reLIQ);
+      if (matchLiq && matchLiq[1]) {
+        const liqNum = matchLiq[1].replace(/\D/g, "");
+        if (mapaRebajos.has(liqNum)) {
+          const tc = mapaRebajos.get(liqNum);
+          if (tc > 0) tcUsado = tc;
+        } else {
+          noEncontrados.push([i + 1, liqNum, descripcion]);
+        }
+      } else {
+        noEncontrados.push([i + 1, "(sin LIQ)", descripcion]);
+      }
+    }
+
+    const importeCRC = montoUSD * tcUsado;
+    if (fecha && nota && Number(importeCRC) !== 0) {
+      salida.push([fecha, nota, Number(importeCRC).toFixed(2)]);
+    }
+  }
+
+  hojaSalida.clearContents();
+  hojaSalida.getRange("A1:C1").setValues([["Fecha", "Nota", "Importe"]]);
+  if (salida.length > 0) hojaSalida.getRange(2, 1, salida.length, 3).setValues(salida);
+
+  // Registro de AFI sin LIQ encontrado
+  const nombreLog = "AFI_noEncontrados";
+  let hojaLog = ss.getSheetByName(nombreLog);
+  if (!hojaLog) hojaLog = ss.insertSheet(nombreLog);
+  hojaLog.clearContents();
+  if (noEncontrados.length > 0) {
+    hojaLog.getRange(1, 1, 1, 3).setValues([["FilaPrueba", "NumLIQ", "Descripcion"]]);
+    hojaLog.getRange(2, 1, noEncontrados.length, 3).setValues(noEncontrados);
+  } else {
+    hojaLog.getRange(1, 1).setValue("✅ Todos los LIQ fueron encontrados en Rebajos.");
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast(
+    `✅ Proceso completo. Filas en Resultado: ${salida.length}. LIQ no encontrados: ${noEncontrados.length}.`
+  );
+}

@@ -1,0 +1,44 @@
+function generarFormatoQuickBooksColones() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaOrigen = ss.getSheetByName("Prueba"); // Hoja de datos origen
+  const hojaDestino = ss.getSheetByName("Resultado"); // Hoja de salida
+
+  // Limpia la hoja de destino y establece encabezados
+  hojaDestino.clearContents();
+  hojaDestino.getRange("A1:C1").setValues([["Fecha", "Nota", "Importe"]]);
+
+  // Obtiene todos los datos del origen
+  const datos = hojaOrigen.getDataRange().getValues();
+  const salida = [];
+
+  // Recorre desde la fila 2 (índice 1 porque la fila 1 son encabezados)
+  for (let i = 1; i < datos.length; i++) {
+    const fila = datos[i];
+
+    const fecha = fila[0];  // Columna A → Fecha
+    const referencia = fila[1]; // Columna B
+    const codigo = fila[3]; // Columna D
+    const descripcion = fila[4]; // Columna E
+    const debitos = parseFloat(fila[7].toString().replace(",", "")) || 0; // Columna H
+    const creditos = parseFloat(fila[8].toString().replace(",", "")) || 0; // Columna I
+
+    // Calcula concatenado automáticamente
+    const nota = `${referencia || ""} ${codigo || ""} ${descripcion || ""}`.trim();
+
+    // Calcula el importe (Créditos - Débitos)
+    const importe = creditos - debitos;
+
+    // Solo copia filas válidas
+    if (fecha && nota && !isNaN(importe) && importe !== 0) {
+      salida.push([fecha, nota, importe]);
+    }
+  }
+
+  // Escribe los resultados si hay filas válidas
+  if (salida.length > 0) {
+    hojaDestino.getRange(2, 1, salida.length, 3).setValues(salida);
+    SpreadsheetApp.getActiveSpreadsheet().toast(`✅ ${salida.length} filas copiadas correctamente (concatenado automático).`);
+  } else {
+    SpreadsheetApp.getActiveSpreadsheet().toast("⚠️ No se encontraron filas válidas (verifica columnas y formato numérico).");
+  }
+}
